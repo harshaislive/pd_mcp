@@ -4,8 +4,7 @@ import httpx
 import os
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
-from fastmcp import FastMCP, MCPRequest
-from fastmcp.server.sse import SSEResponse
+from fastmcp import FastMCP
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
@@ -44,37 +43,24 @@ CONFIG = load_config()
 
 # Initialize FastMCP server with custom error handling
 class PipedriveMCP(FastMCP):
-    async def handle_request(self, request: MCPRequest) -> SSEResponse:
-        """Override handle_request to add custom error handling"""
-        try:
-            # Validate request format
-            if not request or not request.json_data:
-                logger.warning("Empty request received")
-                return SSEResponse(
-                    error={
-                        "code": -32600,
-                        "message": "Invalid Request: Empty request received"
-                    }
-                )
-
-            response = await super().handle_request(request)
-            return response
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parsing error: {str(e)}")
-            return SSEResponse(
-                error={
-                    "code": -32700,
-                    "message": f"Parse error: {str(e)}"
-                }
-            )
-        except Exception as e:
-            logger.error(f"Error handling request: {str(e)}")
-            return SSEResponse(
-                error={
-                    "code": -32603,
-                    "message": f"Internal error: {str(e)}"
-                }
-            )
+    async def handle_error(self, error: Exception) -> Dict[str, Any]:
+        """Custom error handler for FastMCP"""
+        logger.error(f"Error in request: {str(error)}")
+        if isinstance(error, json.JSONDecodeError):
+            return {
+                "code": -32700,
+                "message": f"Parse error: {str(error)}"
+            }
+        elif isinstance(error, ValueError):
+            return {
+                "code": -32600,
+                "message": f"Invalid Request: {str(error)}"
+            }
+        else:
+            return {
+                "code": -32603,
+                "message": f"Internal error: {str(error)}"
+            }
 
 mcp = PipedriveMCP(name="Pipedrive PostgreSQL MCP Server")
 
