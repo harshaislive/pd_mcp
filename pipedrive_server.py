@@ -2,7 +2,7 @@ import asyncio
 import json
 import httpx
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 from fastmcp import FastMCP
 
@@ -34,13 +34,38 @@ def load_config():
 
 PIPEDRIVE_CONFIG = load_config()
 
+# ========================
+# PIPEDRIVE CLIENT
+# ========================
+
+# A mapping of MCP filter types (plural) to Pipedrive API object types (singular)
+# This provides a robust way to determine the correct 'object' for filter conditions.
+PIPEDRIVE_OBJECT_MAP = {
+    "deals": "deal",
+    "activity": "activity",
+    "activities": "activity",
+    "people": "person",
+    "persons": "person",
+    "org": "organization",
+    "organization": "organization",
+    "organizations": "organization",
+    "products": "product",
+    "projects": "project"
+}
+
 class PipedriveClient:
     def __init__(self):
         self.base_url = f"https://{PIPEDRIVE_CONFIG['domain']}.pipedrive.com/api/v1"
         self.api_key = PIPEDRIVE_CONFIG['api_key']
         self.client = httpx.AsyncClient()
     
-    async def make_api_request(self, endpoint: str, method: str = "GET", params: Optional[Dict] = None) -> Dict[str, Any]:
+    async def make_api_request(
+        self,
+        endpoint: str,
+        method: str = "GET",
+        params: Optional[Dict] = None,
+        json_body: Optional[Dict] = None,
+    ) -> Dict[str, Any]:
         """Make an authenticated request to Pipedrive API"""
         
         # Add API key to parameters
@@ -48,15 +73,22 @@ class PipedriveClient:
             params = {}
         params['api_token'] = self.api_key
         
-        url = f"{self.base_url}{endpoint}"
+        # Build URL – handle v2 paths that include full /api/v2 prefix
+        if endpoint.startswith("/api/v2"):
+            # For API v2 we must bypass the default /api/v1 base and start from the domain root
+            url = f"https://{PIPEDRIVE_CONFIG['domain']}.pipedrive.com{endpoint}"
+        else:
+            url = f"{self.base_url}{endpoint}"
         
         try:
             if method == "GET":
                 response = await self.client.get(url, params=params)
             elif method == "POST":
-                response = await self.client.post(url, params=params)
+                response = await self.client.post(url, params=params, json=json_body)
             elif method == "PUT":
-                response = await self.client.put(url, params=params)
+                response = await self.client.put(url, params=params, json=json_body)
+            elif method == "PATCH":
+                response = await self.client.patch(url, params=params, json=json_body)
             elif method == "DELETE":
                 response = await self.client.delete(url, params=params)
             else:
@@ -535,7 +567,7 @@ async def get_deals_summary_by_date(start_date: str = "", end_date: str = "", st
                     value = deal.get("value", 0) or 0
                     total_value += value
                     
-                    stage_name = deal.get("stage", {}).get("name", "Unknown") if deal.get("stage") else "Unknown"
+                    stage_name = deal.get("stage", {}).get("name", "Unknown")
                     stage_counts[stage_name] = stage_counts.get(stage_name, 0) + 1
                     
                     owner_name = deal.get("owner_name", "Unknown")
@@ -1534,6 +1566,1635 @@ async def get_my_pipeline_focus() -> str:
         return json.dumps(result, indent=2)
     except Exception as e:
         return f"Error fetching pipeline focus: {str(e)}"
+
+@mcp.tool()
+async def get_deals_created_v2(start_date: str = "", end_date: str = "", status: str = "open", limit: int = 100) -> str:
+    """
+    Get deals created within a specific time window using Pipedrive **API v2** native filtering (creation date = `add_time`).
+
+    Args:
+        start_date: Start of the date range in YYYY-MM-DD format (inclusive). Defaults to today if empty.
+        end_date: End of the date range in YYYY-MM-DD format (inclusive). Defaults to today if empty.
+        status: Deal status filter – open, won, lost, deleted, all_not_deleted. Defaults to "open".
+        limit: Maximum number of deals to return (<= 500). Defaults to 100.
+
+    Returns:
+        JSON string with filtered deals or an error message.
+    """
+    try:
+        # Validate & prepare dates
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if not start_date:
+            start_date = today_str
+        if not end_date:
+            end_date = today_str
+
+        if start_date > end_date:
+            return json.dumps({"success": False, "error": "start_date must be before or equal to end_date"}, indent=2)
+
+        # Convert to RFC3339
+        start_dt = f"{start_date}T00:00:00Z"
+        end_dt = f"{end_date}T23:59:59Z"
+
+        # Sanitize other params
+        limit = max(1, min(limit, 500))
+        valid_statuses = {"open", "won", "lost", "deleted", "all_not_deleted"}
+        if status not in valid_statuses:
+            return json.dumps({"success": False, "error": f"Invalid status. Must be one of {', '.join(valid_statuses)}"}, indent=2)
+
+        # Prepare request params – v2 supports created_since/created_until
+        params = {
+            "status": status,
+            "limit": 500,  # page size – we'll trim to user limit later
+            "sort_by": "add_time",
+            "sort_direction": "asc",
+            "created_since": start_dt,
+            "created_until": end_dt
+        }
+
+        collected: list[dict[str, Any]] = []
+        cursor: Optional[str] = None
+
+        while len(collected) < limit:
+            if cursor:
+                params["cursor"] = cursor
+            response = await pipedrive_client.make_api_request("/api/v2/deals", params=params)
+
+            if not response.get("success"):
+                return json.dumps({"success": False, "error": response.get("error", "Unknown API error")}, indent=2)
+
+            data = response.get("data", [])
+            collected.extend(data[: max(0, limit - len(collected))])
+
+            cursor = response.get("additional_data", {}).get("next_cursor")
+            if not cursor:
+                break
+
+        # Trim to requested limit
+        collected = collected[:limit]
+
+        return json.dumps({
+            "success": True,
+            "total_returned": len(collected),
+            "date_range": f"{start_date} to {end_date}",
+            "status_filter": status,
+            "deals": collected
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def get_deals_created_v1(start_date: str = "", end_date: str = "", status: str = "open", limit: int = 100, filter_id: Optional[str] = None) -> str:
+    """
+    Get deals created within a specific time window using **API v1**.
+
+    API v1 does **not** natively filter by creation date. To stay in the "API filtering only" constraint, you must pre-create a Pipedrive filter that contains the creation-date condition and supply its `filter_id`.
+
+    Args:
+        start_date: Unused – kept for signature parity; ignored when filter_id is provided.
+        end_date: Unused – kept for signature parity; ignored when filter_id is provided.
+        status: Deal status filter – open, won, lost, deleted, all_not_deleted. Defaults to "open".
+        limit: Maximum number of deals to return (<= 500). Defaults to 100.
+        filter_id: ID of a saved Pipedrive filter that already encodes the create-date window.
+
+    Returns:
+        JSON string with filtered deals or explanation why filter_id is required.
+    """
+    try:
+        if filter_id is None:
+            msg = (
+                "API v1 does not support native creation-date filtering. "
+                "Create a Pipedrive filter with the desired date range on the Add Time field and provide its ID via the `filter_id` parameter."
+            )
+            return json.dumps({"success": False, "error": msg}, indent=2)
+
+        limit = max(1, min(limit, 500))
+        valid_statuses = {"open", "won", "lost", "deleted", "all_not_deleted"}
+        if status not in valid_statuses:
+            return json.dumps({"success": False, "error": f"Invalid status. Must be one of {', '.join(valid_statuses)}"}, indent=2)
+
+        params = {
+            "filter_id": filter_id,
+            "status": status,
+            "limit": limit
+        }
+
+        response = await pipedrive_client.make_api_request("/deals", params=params)
+        return json.dumps(response, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+# ========================
+# FILTER MANAGEMENT TOOLS
+# ========================
+
+@mcp.tool()
+async def create_deals_addtime_filter(start_date: str, end_date: str, name: str = "", share: bool = False) -> str:
+    """Create a Pipedrive *deals* filter that matches deals **created between** the given dates.
+
+    Args:
+        start_date: YYYY-MM-DD inclusive lower bound for `add_time`.
+        end_date: YYYY-MM-DD inclusive upper bound for `add_time`.
+        name: Optional name for the filter. Defaults to "MCP deals {start_date} to {end_date}".
+        share: If **True**, attempts to create a shared filter (visible to others). Requires admin rights.
+
+    Returns:
+        JSON string containing `filter_id` on success or an error message.
+    """
+    try:
+        if start_date > end_date:
+            return json.dumps({"success": False, "error": "start_date must be <= end_date"}, indent=2)
+
+        if not name:
+            name = f"MCP deals {start_date} to {end_date}"
+
+        # Build conditions structure per Pipedrive docs
+        conditions = {
+            "glue": "and",
+            "conditions": [
+                {
+                    "glue": "and",
+                    "conditions": [
+                        {
+                            "object": "deal",
+                            "field_id": "add_time",
+                            "operator": "between",
+                            "value": start_date,
+                            "extra_value": end_date
+                        }
+                    ]
+                },
+                {"glue": "or", "conditions": []}
+            ]
+        }
+
+        body = {
+            "name": name,
+            "type": "deals",
+            "conditions": conditions
+        }
+
+        if share:
+            body["visible_to"] = "3"  # 3 = shared (per Pipedrive UI)
+
+        response = await pipedrive_client.make_api_request(
+            "/filters", method="POST", json_body=body
+        )
+
+        if not response.get("success"):
+            return json.dumps({"success": False, "error": response.get("error", "Unknown API error")}, indent=2)
+
+        return json.dumps({"success": True, "filter_id": response.get("data", {}).get("id"), "name": name}, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def update_deals_filter_date_range(filter_id: int, start_date: str, end_date: str, name: str = "") -> str:
+    """Update an existing *deals* filter to a new creation-date window.
+
+    Args:
+        filter_id: ID of the filter to update.
+        start_date: New start date (YYYY-MM-DD).
+        end_date: New end date (YYYY-MM-DD).
+        name: Optional new name; leave blank to keep existing.
+    """
+    try:
+        if start_date > end_date:
+            return json.dumps({"success": False, "error": "start_date must be <= end_date"}, indent=2)
+
+        # Build new conditions
+        conditions = {
+            "glue": "and",
+            "conditions": [
+                {
+                    "glue": "and",
+                    "conditions": [
+                        {
+                            "object": "deal",
+                            "field_id": "add_time",
+                            "operator": "between",
+                            "value": start_date,
+                            "extra_value": end_date
+                        }
+                    ]
+                },
+                {"glue": "or", "conditions": []}
+            ]
+        }
+
+        body: Dict[str, Any] = {"conditions": conditions}
+        if name:
+            body["name"] = name
+
+        response = await pipedrive_client.make_api_request(
+            f"/filters/{filter_id}", method="PUT", json_body=body
+        )
+
+        if not response.get("success"):
+            return json.dumps({"success": False, "error": response.get("error", "Unknown API error")}, indent=2)
+
+        return json.dumps({"success": True, "updated_filter_id": filter_id}, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def delete_filter(filter_id: int) -> str:
+    """Delete a Pipedrive filter by ID.
+
+    Args:
+        filter_id: ID of the filter to delete.
+    """
+    try:
+        response = await pipedrive_client.make_api_request(
+            f"/filters/{filter_id}", method="DELETE"
+        )
+        if not response.get("success"):
+            return json.dumps({"success": False, "error": response.get("error", "Unknown API error")}, indent=2)
+        return json.dumps({"success": True, "deleted_filter_id": filter_id}, indent=2)
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+@mcp.tool()
+async def get_deal_fields() -> str:
+    """Get all deal fields to find field IDs for filter creation.
+    
+    This helps identify the correct field_id values needed for creating filters.
+    Look for fields like 'add_time', 'update_time', 'expected_close_date', etc.
+    
+    Returns:
+        JSON string containing all deal fields with their IDs and details.
+    """
+    try:
+        response = await pipedrive_client.make_api_request("/dealFields")
+        return json.dumps(response, indent=2)
+    except Exception as e:
+        return f"Error fetching deal fields: {str(e)}"
+
+@mcp.tool()
+async def create_deals_filter_flexible(field_id: str, operator: str, value: str, extra_value: str = "", name: str = "", share: bool = False) -> str:
+    """Create a flexible Pipedrive deals filter with any field and operator.
+    
+    Use get_deal_fields() first to find the correct field_id values.
+    
+    Args:
+        field_id: The field ID (usually a number as string, e.g., "add_time" might be "123").
+        operator: Operator like "between", ">=", "<=", "=", etc.
+        value: Primary value for the condition.
+        extra_value: Secondary value (used with "between" operator for end date).
+        name: Optional filter name. Auto-generated if empty.
+        share: Whether to create a shared filter (requires admin rights).
+        
+    Returns:
+        JSON string with filter_id on success.
+    """
+    try:
+        if not name:
+            name = f"MCP filter {field_id} {operator} {value}"
+            if extra_value:
+                name += f" to {extra_value}"
+
+        conditions = {
+            "glue": "and",
+            "conditions": [
+                {
+                    "glue": "and",
+                    "conditions": [
+                        {
+                            "object": "deal",
+                            "field_id": field_id,
+                            "operator": operator,
+                            "value": value,
+                            "extra_value": extra_value if extra_value else None
+                        }
+                    ]
+                },
+                {"glue": "or", "conditions": []}
+            ]
+        }
+
+        body = {
+            "name": name,
+            "type": "deals",
+            "conditions": conditions
+        }
+
+        if share:
+            body["visible_to"] = "3"
+
+        response = await pipedrive_client.make_api_request(
+            "/filters", method="POST", json_body=body
+        )
+
+        if not response.get("success"):
+            return json.dumps({"success": False, "error": response.get("error", "Unknown API error")}, indent=2)
+
+        return json.dumps({
+            "success": True, 
+            "filter_id": response.get("data", {}).get("id"), 
+            "name": name,
+            "field_used": field_id,
+            "operator": operator
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+@mcp.tool()
+async def get_deals_with_filter(filter_id: str, status: str = "open", limit: int = 100) -> str:
+    """Get deals using an existing Pipedrive filter.
+    
+    Args:
+        filter_id: ID of the existing filter to apply.
+        status: Deal status filter (open, won, lost, deleted, all_not_deleted).
+        limit: Maximum number of deals to return (<= 500).
+        
+    Returns:
+        JSON string with filtered deals.
+    """
+    try:
+        limit = max(1, min(limit, 500))
+        valid_statuses = {"open", "won", "lost", "deleted", "all_not_deleted"}
+        if status not in valid_statuses:
+            return json.dumps({"success": False, "error": f"Invalid status. Must be one of {', '.join(valid_statuses)}"}, indent=2)
+
+        params = {
+            "filter_id": int(filter_id),  # Convert to int for API
+            "status": status,
+            "limit": limit
+        }
+
+        response = await pipedrive_client.make_api_request("/deals", params=params)
+        
+        # Add some metadata to the response
+        if response.get("success"):
+            result = {
+                "success": True,
+                "filter_id_used": filter_id,
+                "status_filter": status,
+                "total_returned": len(response.get("data", [])),
+                "deals": response.get("data", []),
+                "additional_data": response.get("additional_data", {})
+            }
+            return json.dumps(result, indent=2)
+        else:
+            return json.dumps(response, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+@mcp.tool()
+async def create_filter_any_type(filter_type: str, field_id: str, operator: str, value: str, extra_value: str = "", name: str = "", share: bool = False) -> str:
+    """Create a Pipedrive filter for any entity type (deals, activities, people, org, products).
+    
+    Args:
+        filter_type: Type of filter - "deals", "activity", "people", "org", "products".
+        field_id: The field ID for the condition.
+        operator: Operator like "between", ">=", "<=", "=", etc.
+        value: Primary value for the condition.
+        extra_value: Secondary value (used with "between" operator).
+        name: Optional filter name. Auto-generated if empty.
+        share: Whether to create a shared filter.
+        
+    Returns:
+        JSON string with filter_id on success.
+    """
+    try:
+        valid_types = {"deals", "activity", "people", "org", "products", "projects"}
+        if filter_type not in valid_types:
+            return json.dumps({"success": False, "error": f"Invalid filter_type. Must be one of {', '.join(valid_types)}"}, indent=2)
+
+        if not name:
+            name = f"MCP {filter_type} filter {field_id} {operator} {value}"
+            if extra_value:
+                name += f" to {extra_value}"
+
+        # Map filter type to object type for conditions
+        object_map = {
+            "deals": "deal",
+            "activity": "activity", 
+            "people": "person",
+            "org": "organization",
+            "products": "product",
+            "projects": "project"
+        }
+
+        conditions = {
+            "glue": "and",
+            "conditions": [
+                {
+                    "glue": "and",
+                    "conditions": [
+                        {
+                            "object": object_map[filter_type],
+                            "field_id": field_id,
+                            "operator": operator,
+                            "value": value,
+                            "extra_value": extra_value if extra_value else None
+                        }
+                    ]
+                },
+                {"glue": "or", "conditions": []}
+            ]
+        }
+
+        body = {
+            "name": name,
+            "type": filter_type,
+            "conditions": conditions
+        }
+
+        if share:
+            body["visible_to"] = "3"
+
+        response = await pipedrive_client.make_api_request(
+            "/filters", method="POST", json_body=body
+        )
+
+        if not response.get("success"):
+            return json.dumps({"success": False, "error": response.get("error", "Unknown API error")}, indent=2)
+
+        return json.dumps({
+            "success": True, 
+            "filter_id": response.get("data", {}).get("id"), 
+            "name": name,
+            "filter_type": filter_type,
+            "field_used": field_id,
+            "operator": operator
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def get_activities_with_filter(filter_id: str, done: int = 0, limit: int = 100) -> str:
+    """Get activities using an existing Pipedrive filter.
+    
+    Args:
+        filter_id: ID of the existing activity filter to apply.
+        done: Activity completion status (0 = not done, 1 = done).
+        limit: Maximum number of activities to return (<= 500).
+        
+    Returns:
+        JSON string with filtered activities.
+    """
+    try:
+        limit = max(1, min(limit, 500))
+        
+        params = {
+            "filter_id": int(filter_id),
+            "done": done,
+            "limit": limit
+        }
+
+        response = await pipedrive_client.make_api_request("/activities", params=params)
+        
+        if response.get("success"):
+            data = response.get("data") or []
+            result = {
+                "success": True,
+                "filter_id_used": filter_id,
+                "done_filter": done,
+                "total_returned": len(data),
+                "activities": data,
+                "additional_data": response.get("additional_data", {})
+            }
+            return json.dumps(result, indent=2)
+        else:
+            return json.dumps(response, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def get_persons_with_filter(filter_id: str, limit: int = 100) -> str:
+    """Get persons using an existing Pipedrive filter.
+    
+    Args:
+        filter_id: ID of the existing person filter to apply.
+        limit: Maximum number of persons to return (<= 500).
+        
+    Returns:
+        JSON string with filtered persons.
+    """
+    try:
+        limit = max(1, min(limit, 500))
+        
+        params = {
+            "filter_id": int(filter_id),
+            "limit": limit
+        }
+
+        response = await pipedrive_client.make_api_request("/persons", params=params)
+        
+        if response.get("success"):
+            data = response.get("data") or []
+            result = {
+                "success": True,
+                "filter_id_used": filter_id,
+                "total_returned": len(data),
+                "persons": data,
+                "additional_data": response.get("additional_data", {})
+            }
+            return json.dumps(result, indent=2)
+        else:
+            return json.dumps(response, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def get_organizations_with_filter(filter_id: str, limit: int = 100) -> str:
+    """Get organizations using an existing Pipedrive filter.
+    
+    Args:
+        filter_id: ID of the existing organization filter to apply.
+        limit: Maximum number of organizations to return (<= 500).
+        
+    Returns:
+        JSON string with filtered organizations.
+    """
+    try:
+        limit = max(1, min(limit, 500))
+        
+        params = {
+            "filter_id": int(filter_id),
+            "limit": limit
+        }
+
+        response = await pipedrive_client.make_api_request("/organizations", params=params)
+        
+        if response.get("success"):
+            data = response.get("data") or []
+            result = {
+                "success": True,
+                "filter_id_used": filter_id,
+                "total_returned": len(data),
+                "organizations": data,
+                "additional_data": response.get("additional_data", {})
+            }
+            return json.dumps(result, indent=2)
+        else:
+            return json.dumps(response, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def get_field_ids_for_entity(entity_type: str) -> str:
+    """Get field IDs for any Pipedrive entity type to help with filter creation.
+    
+    Args:
+        entity_type: Type of entity - "deals", "activities", "persons", "organizations", "products".
+        
+    Returns:
+        JSON string containing all fields with their IDs for the specified entity.
+    """
+    try:
+        endpoint_map = {
+            "deals": "/dealFields",
+            "activities": "/activityFields", 
+            "persons": "/personFields",
+            "organizations": "/organizationFields",
+            "products": "/productFields"
+        }
+        
+        if entity_type not in endpoint_map:
+            return json.dumps({"success": False, "error": f"Invalid entity_type. Must be one of {', '.join(endpoint_map.keys())}"}, indent=2)
+        
+        response = await pipedrive_client.make_api_request(endpoint_map[entity_type])
+        
+        if response.get("success"):
+            # Simplify the response to show key field info
+            fields_info = []
+            for field in response.get("data", []):
+                fields_info.append({
+                    "id": field.get("id"),
+                    "key": field.get("key"),
+                    "name": field.get("name"),
+                    "field_type": field.get("field_type")
+                })
+            
+            result = {
+                "success": True,
+                "entity_type": entity_type,
+                "total_fields": len(fields_info),
+                "fields": fields_info
+            }
+            return json.dumps(result, indent=2)
+        else:
+            return json.dumps(response, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+@mcp.tool()
+async def debug_filter_response(filter_id: str, entity_type: str = "deals") -> str:
+    """Debug a filter by showing the raw API response and filter details.
+    
+    Args:
+        filter_id: ID of the filter to debug.
+        entity_type: Type of entity to test ("deals", "activities", "persons", "organizations").
+        
+    Returns:
+        JSON string with detailed debug information.
+    """
+    try:
+        # First get filter details
+        filter_response = await pipedrive_client.make_api_request(f"/filters/{filter_id}")
+        
+        # Then test with the entity endpoint
+        endpoint_map = {
+            "deals": "/deals",
+            "activities": "/activities", 
+            "persons": "/persons",
+            "organizations": "/organizations"
+        }
+        
+        if entity_type not in endpoint_map:
+            return json.dumps({"success": False, "error": f"Invalid entity_type. Must be one of {', '.join(endpoint_map.keys())}"}, indent=2)
+        
+        params = {"filter_id": int(filter_id), "limit": 5}  # Small limit for testing
+        entity_response = await pipedrive_client.make_api_request(endpoint_map[entity_type], params=params)
+        
+        result = {
+            "success": True,
+            "filter_id": filter_id,
+            "entity_type": entity_type,
+            "filter_details": filter_response,
+            "entity_response": entity_response,
+            "data_type": type(entity_response.get("data")).__name__ if entity_response.get("data") is not None else "None",
+            "data_length": len(entity_response.get("data", [])) if entity_response.get("data") else 0
+        }
+        
+        return json.dumps(result, indent=2)
+        
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+@mcp.tool()
+async def create_advanced_filter(
+    filter_type: str,
+    conditions_all: List[Dict] = None,
+    conditions_any: List[Dict] = None,
+    name: str = "",
+    share: bool = False
+) -> str:
+    """Create a sophisticated Pipedrive filter with ALL and ANY condition groups. (Max 16 total conditions).
+    
+    Args:
+        filter_type: Type of filter - "deals", "activity", "people", "org", "products".
+        conditions_all: List of conditions that ALL must match. Each condition is a dict with:
+            - object: "deal", "person", "organization", "product", "activity"
+            - field_id: Field ID to filter on
+            - operator: "=", "!=", ">", "<", ">=", "<=", "LIKE", "IS NULL", "IS NOT NULL", "BETWEEN"
+            - value: Primary value
+            - extra_value: Secondary value (for BETWEEN operator)
+        conditions_any: List of conditions where ANY can match (same structure as conditions_all)
+        name: Optional filter name
+        share: Whether to create a shared filter
+        
+    Cross-Object Filter Example (Find people with a won deal):
+        filter_type: "people"
+        conditions_all: [{
+            "object": "deal", 
+            "field_id": "status",
+            "operator": "=",
+            "value": "won"
+        }]
+        
+    Returns:
+        JSON string with filter_id and details.
+    """
+    try:
+        valid_types = PIPEDRIVE_OBJECT_MAP.keys()
+        if filter_type not in valid_types:
+            return json.dumps({"success": False, "error": f"Invalid filter_type. Must be one of {', '.join(valid_types)}"}, indent=2)
+
+        # Auto-generate name if not provided
+        if not name:
+            name = f"MCP {filter_type} filter {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            
+        # Validate condition count (Pipedrive API limit is 16)
+        total_conditions = len(conditions_all or []) + len(conditions_any or [])
+        if total_conditions > 16:
+            return json.dumps({"success": False, "error": f"Filter exceeds the 16-condition limit (found {total_conditions}). Please simplify the filter."}, indent=2)
+        if total_conditions == 0:
+            return json.dumps({"success": False, "error": "At least one condition must be provided in conditions_all or conditions_any."}, indent=2)
+
+        # Build the conditions structure
+        conditions = {
+            "glue": "and",
+            "conditions": []
+        }
+        
+        # Add ALL conditions group if provided
+        if conditions_all:
+            conditions["conditions"].append({
+                "glue": "and",
+                "conditions": conditions_all
+            })
+            
+        # Add ANY conditions group if provided
+        if conditions_any:
+            conditions["conditions"].append({
+                "glue": "or",
+                "conditions": conditions_any
+            })
+            
+        if not conditions["conditions"]:
+            return json.dumps({"success": False, "error": "At least one condition group (ALL or ANY) must be provided"}, indent=2)
+
+        body = {
+            "name": name,
+            "type": filter_type,
+            "conditions": conditions
+        }
+
+        if share:
+            body["visible_to"] = "3"  # Shared with all users
+
+        response = await pipedrive_client.make_api_request(
+            "/filters", method="POST", json_body=body
+        )
+        
+        if not response.get("success"):
+            return json.dumps({
+                "success": False,
+                "error": response.get("error", "Unknown API error"),
+                "attempted_conditions": conditions
+            }, indent=2)
+
+        return json.dumps({
+            "success": True,
+            "filter_id": response.get("data", {}).get("id"),
+            "name": name,
+            "filter_type": filter_type,
+            "conditions_used": conditions
+        }, indent=2)
+
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+@mcp.tool()
+async def create_date_range_filter(
+    filter_type: str,
+    field_id: str,
+    start_date: str,
+    end_date: str = "",
+    additional_conditions: List[Dict] = None,
+    name: str = "",
+    share: bool = False
+) -> str:
+    """Create a filter for items within a date range, with optional additional conditions.
+    
+    Args:
+        filter_type: Type of filter - "deals", "activity", "people", "org", "products"
+        field_id: ID of the date field to filter on (e.g., "add_time", "update_time")
+        start_date: YYYY-MM-DD start date (inclusive)
+        end_date: YYYY-MM-DD end date (inclusive). If empty, only filters for >= start_date
+        additional_conditions: Optional list of additional conditions that must ALL match
+        name: Optional filter name
+        share: Whether to create a shared filter
+        
+    Returns:
+        JSON string with filter_id and details.
+    """
+    try:
+        if filter_type not in PIPEDRIVE_OBJECT_MAP:
+            return json.dumps({"success": False, "error": f"Invalid filter_type. Must be one of {', '.join(PIPEDRIVE_OBJECT_MAP.keys())}"}, indent=2)
+
+        # Build the date condition
+        date_condition = {
+            "object": PIPEDRIVE_OBJECT_MAP[filter_type],
+            "field_id": field_id,
+            "operator": "between" if end_date else ">=",
+            "value": start_date
+        }
+        
+        if end_date:
+            date_condition["extra_value"] = end_date
+            
+        # Combine with additional conditions
+        conditions_all = [date_condition]
+        if additional_conditions:
+            conditions_all.extend(additional_conditions)
+            
+        return await create_advanced_filter(
+            filter_type=filter_type,
+            conditions_all=conditions_all,
+            name=name,
+            share=share
+        )
+        
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def create_status_filter(
+    filter_type: str,
+    statuses: List[str],
+    status_field_id: str = "status",
+    require_all: bool = False,
+    additional_conditions: List[Dict] = None,
+    name: str = "",
+    share: bool = False
+) -> str:
+    """Create a filter for items matching one or more status values.
+    
+    Args:
+        filter_type: Type of filter - "deals", "activity", "people", "org", "products"
+        statuses: List of status values to match
+        status_field_id: The API field_id for status (e.g. 'status' for deals, 'done' for activities).
+        require_all: If True, item must match ALL statuses. If False, matches ANY status.
+        additional_conditions: Optional list of additional conditions that must ALL match
+        name: Optional filter name
+        share: Whether to create a shared filter
+        
+    Returns:
+        JSON string with filter_id and details.
+    """
+    try:
+        if filter_type not in PIPEDRIVE_OBJECT_MAP:
+            return json.dumps({"success": False, "error": f"Invalid filter_type. Must be one of {', '.join(PIPEDRIVE_OBJECT_MAP.keys())}"}, indent=2)
+
+        # Build status conditions
+        status_conditions = []
+        for status in statuses:
+            status_conditions.append({
+                "object": PIPEDRIVE_OBJECT_MAP[filter_type],
+                "field_id": status_field_id,
+                "operator": "=",
+                "value": status
+            })
+            
+        if require_all:
+            # All statuses must match (rare, but possible for custom status fields)
+            conditions_all = status_conditions
+            if additional_conditions:
+                conditions_all.extend(additional_conditions)
+            return await create_advanced_filter(
+                filter_type=filter_type,
+                conditions_all=conditions_all,
+                name=name,
+                share=share
+            )
+        else:
+            # Any status can match (more common)
+            conditions_all = additional_conditions if additional_conditions else None
+            return await create_advanced_filter(
+                filter_type=filter_type,
+                conditions_all=conditions_all,
+                conditions_any=status_conditions,
+                name=name,
+                share=share
+            )
+            
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def list_my_filters(filter_type: str = "") -> str:
+    """List all filters available to you, optionally filtered by type. Note: Pipedrive has a company-wide limit of 5000 filters.
+    
+    Args:
+        filter_type: Optional type to filter by - "deals", "activity", "people", "org", "products"
+        
+    Returns:
+        JSON string with filter list and details.
+    """
+    try:
+        params = {}
+        if filter_type:
+            valid_types = PIPEDRIVE_OBJECT_MAP.keys()
+            if filter_type not in valid_types:
+                return json.dumps({"success": False, "error": f"Invalid filter_type. Must be one of {', '.join(valid_types)}"}, indent=2)
+            params["type"] = filter_type
+            
+        response = await pipedrive_client.make_api_request("/filters", params=params)
+        
+        if response.get("success"):
+            filters = []
+            for f in response.get("data", []):
+                filters.append({
+                    "id": f.get("id"),
+                    "name": f.get("name"),
+                    "type": f.get("type"),
+                    "conditions": f.get("conditions"),
+                    "add_time": f.get("add_time"),
+                    "visible_to": "shared" if f.get("visible_to") == 3 else "private"
+                })
+                
+            result = {
+                "success": True,
+                "total_filters": len(filters),
+                "filters": filters
+            }
+            return json.dumps(result, indent=2)
+        else:
+            return json.dumps(response, indent=2)
+            
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)}, indent=2)
+
+# ========================
+# NOTES
+# ========================
+
+@mcp.tool()
+async def add_note_to_deal(deal_id: int, content: str) -> str:
+    """
+    Adds a new note to a specific deal.
+    
+    Args:
+        deal_id: The ID of the deal to add the note to.
+        content: The content of the note in HTML or plain text.
+    
+    Returns:
+        JSON string containing the details of the created note.
+    """
+    try:
+        json_body = {
+            "deal_id": deal_id,
+            "content": content
+        }
+        response = await pipedrive_client.make_api_request("/notes", method="POST", json_body=json_body)
+        return json.dumps(response, indent=2)
+    except Exception as e:
+        return f"Error adding note to deal: {str(e)}"
+
+@mcp.tool()
+async def update_note(note_id: int, content: str) -> str:
+    """
+    Updates an existing note.
+    
+    Args:
+        note_id: The ID of the note to update.
+        content: The new content of the note in HTML or plain text.
+    
+    Returns:
+        JSON string containing the details of the updated note.
+    """
+    try:
+        json_body = {
+            "content": content
+        }
+        response = await pipedrive_client.make_api_request(f"/notes/{note_id}", method="PUT", json_body=json_body)
+        return json.dumps(response, indent=2)
+    except Exception as e:
+        return f"Error updating note: {str(e)}"
+
+# ========================
+# BUSINESS INTELLIGENCE & FOUNDER ANALYTICS
+# ========================
+
+@mcp.tool()
+async def get_deal_owner_performance(start_date: str = "", end_date: str = "", include_activities: bool = True) -> str:
+    """
+    Get comprehensive performance analytics for each deal owner/user.
+    Critical for founder-level performance reviews and BI analysis.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format (default: 30 days ago)
+        end_date: End date in YYYY-MM-DD format (default: today)
+        include_activities: Whether to include activity metrics (default: True)
+    
+    Returns:
+        JSON string with detailed performance metrics per owner
+    """
+    try:
+        # Default to last 30 days if no dates provided
+        now = datetime.now()
+        if not end_date:
+            end_date = now.strftime("%Y-%m-%d")
+        if not start_date:
+            start_date = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        
+        # Get all users first
+        users_response = await pipedrive_client.make_api_request("/users")
+        if not users_response.get("success"):
+            return f"Error fetching users: {users_response}"
+        
+        users = {user["id"]: user for user in users_response.get("data", [])}
+        
+        # Initialize performance tracking
+        owner_performance = {}
+        
+        # Get deals for the period (all statuses to calculate conversion rates)
+        params = {
+            "status": "all_not_deleted",
+            "limit": 500
+        }
+        
+        deals_response = await pipedrive_client.make_api_request("/deals", params=params)
+        if not deals_response.get("success"):
+            return f"Error fetching deals: {deals_response}"
+        
+        for deal in deals_response.get("data", []):
+            # Filter by date range (use add_time for creation analysis)
+            add_time = deal.get("add_time", "")
+            if add_time:
+                deal_date = add_time.split("T")[0]
+                if not (start_date <= deal_date <= end_date):
+                    continue
+            
+            owner_id = deal.get("owner_id")
+            if not owner_id:
+                continue
+                
+            if owner_id not in owner_performance:
+                user_info = users.get(owner_id, {})
+                owner_performance[owner_id] = {
+                    "owner_id": owner_id,
+                    "owner_name": user_info.get("name", f"User {owner_id}"),
+                    "owner_email": user_info.get("email", ""),
+                    "deals_created": 0,
+                    "deals_won": 0,
+                    "deals_lost": 0,
+                    "deals_open": 0,
+                    "total_value_created": 0,
+                    "total_value_won": 0,
+                    "total_value_lost": 0,
+                    "total_value_open": 0,
+                    "avg_deal_value": 0,
+                    "win_rate": 0,
+                    "loss_rate": 0,
+                    "activities_count": 0,
+                    "overdue_activities": 0
+                }
+            
+            # Track deal metrics
+            value = deal.get("value", 0) or 0
+            status = deal.get("status")
+            
+            owner_performance[owner_id]["deals_created"] += 1
+            owner_performance[owner_id]["total_value_created"] += value
+            
+            if status == "won":
+                owner_performance[owner_id]["deals_won"] += 1
+                owner_performance[owner_id]["total_value_won"] += value
+            elif status == "lost":
+                owner_performance[owner_id]["deals_lost"] += 1
+                owner_performance[owner_id]["total_value_lost"] += value
+            elif status == "open":
+                owner_performance[owner_id]["deals_open"] += 1
+                owner_performance[owner_id]["total_value_open"] += value
+        
+        # Calculate derived metrics and activity data
+        if include_activities:
+            # Get activities for the period
+            activities_params = {"limit": 500}
+            activities_response = await pipedrive_client.make_api_request("/activities", params=activities_params)
+            
+            if activities_response.get("success"):
+                today = datetime.now().strftime("%Y-%m-%d")
+                
+                for activity in activities_response.get("data", []):
+                    user_id = activity.get("user_id")
+                    if user_id in owner_performance:
+                        owner_performance[user_id]["activities_count"] += 1
+                        
+                        # Check if overdue
+                        due_date = activity.get("due_date")
+                        done = activity.get("done")
+                        if due_date and due_date < today and not done:
+                            owner_performance[user_id]["overdue_activities"] += 1
+        
+        # Calculate final metrics
+        for owner_id, metrics in owner_performance.items():
+            total_closed = metrics["deals_won"] + metrics["deals_lost"]
+            if total_closed > 0:
+                metrics["win_rate"] = round((metrics["deals_won"] / total_closed) * 100, 2)
+                metrics["loss_rate"] = round((metrics["deals_lost"] / total_closed) * 100, 2)
+            
+            if metrics["deals_created"] > 0:
+                metrics["avg_deal_value"] = round(metrics["total_value_created"] / metrics["deals_created"], 2)
+        
+        # Sort by total value created (descending)
+        sorted_performance = sorted(owner_performance.values(), 
+                                  key=lambda x: x["total_value_created"], reverse=True)
+        
+        # Calculate team totals
+        team_totals = {
+            "total_deals_created": sum(p["deals_created"] for p in sorted_performance),
+            "total_deals_won": sum(p["deals_won"] for p in sorted_performance),
+            "total_deals_lost": sum(p["deals_lost"] for p in sorted_performance),
+            "total_value_created": sum(p["total_value_created"] for p in sorted_performance),
+            "total_value_won": sum(p["total_value_won"] for p in sorted_performance),
+            "team_win_rate": 0,
+            "active_owners": len(sorted_performance)
+        }
+        
+        total_closed_team = team_totals["total_deals_won"] + team_totals["total_deals_lost"]
+        if total_closed_team > 0:
+            team_totals["team_win_rate"] = round((team_totals["total_deals_won"] / total_closed_team) * 100, 2)
+        
+        result = {
+            "success": True,
+            "date_range": f"{start_date} to {end_date}",
+            "team_summary": team_totals,
+            "owner_performance": sorted_performance,
+            "note": "Performance metrics based on deal creation date. Use for founder reviews and performance analysis."
+        }
+        
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error generating owner performance report: {str(e)}"
+
+@mcp.tool()
+async def get_revenue_forecast(days_ahead: int = 30, confidence_level: str = "medium") -> str:
+    """
+    Generate revenue forecast based on current pipeline and historical close rates.
+    Critical for founder-level revenue planning and BI forecasting.
+    
+    Args:
+        days_ahead: Number of days to forecast (default: 30)
+        confidence_level: Forecast confidence level - "conservative", "medium", "optimistic" (default: "medium")
+    
+    Returns:
+        JSON string with revenue forecast and pipeline analysis
+    """
+    try:
+        today = datetime.now()
+        forecast_date = (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+        
+        # Get open deals
+        params = {"status": "open", "limit": 500}
+        deals_response = await pipedrive_client.make_api_request("/deals", params=params)
+        
+        if not deals_response.get("success"):
+            return f"Error fetching deals: {deals_response}"
+        
+        # Get historical win rates by stage (last 90 days)
+        historical_start = (today - timedelta(days=90)).strftime("%Y-%m-%d")
+        historical_params = {"status": "all_not_deleted", "limit": 500}
+        historical_response = await pipedrive_client.make_api_request("/deals", params=historical_params)
+        
+        # Calculate historical win rates by stage
+        stage_stats = {}
+        if historical_response.get("success"):
+            for deal in historical_response.get("data", []):
+                stage_id = deal.get("stage_id")
+                status = deal.get("status")
+                
+                if stage_id and status in ["won", "lost"]:
+                    if stage_id not in stage_stats:
+                        stage_stats[stage_id] = {"won": 0, "lost": 0, "total": 0}
+                    
+                    stage_stats[stage_id][status] += 1
+                    stage_stats[stage_id]["total"] += 1
+        
+        # Calculate win rates by stage
+        stage_win_rates = {}
+        for stage_id, stats in stage_stats.items():
+            if stats["total"] > 0:
+                win_rate = stats["won"] / stats["total"]
+                stage_win_rates[stage_id] = win_rate
+            else:
+                stage_win_rates[stage_id] = 0.3  # Default 30% if no historical data
+        
+        # Confidence multipliers
+        confidence_multipliers = {
+            "conservative": 0.7,
+            "medium": 1.0,
+            "optimistic": 1.3
+        }
+        multiplier = confidence_multipliers.get(confidence_level, 1.0)
+        
+        # Analyze current pipeline
+        forecast_data = {
+            "closing_soon": [],  # Expected close date within forecast period
+            "pipeline_weighted": [],  # All open deals with probability weighting
+            "by_stage": {},
+            "by_owner": {}
+        }
+        
+        total_pipeline_value = 0
+        weighted_forecast = 0
+        closing_soon_value = 0
+        
+        for deal in deals_response.get("data", []):
+            value = deal.get("value", 0) or 0
+            total_pipeline_value += value
+            
+            stage_id = deal.get("stage_id")
+            stage_name = deal.get("stage", {}).get("name", "Unknown")
+            owner_name = deal.get("owner_name", "Unknown")
+            expected_close = deal.get("expected_close_date")
+            
+            # Get win probability for this stage
+            win_probability = stage_win_rates.get(stage_id, 0.3)
+            
+            # Apply confidence multiplier
+            adjusted_probability = min(win_probability * multiplier, 1.0)
+            weighted_value = value * adjusted_probability
+            weighted_forecast += weighted_value
+            
+            deal_data = {
+                "id": deal.get("id"),
+                "title": deal.get("title"),
+                "value": value,
+                "stage": stage_name,
+                "owner": owner_name,
+                "expected_close_date": expected_close,
+                "win_probability": round(win_probability * 100, 1),
+                "adjusted_probability": round(adjusted_probability * 100, 1),
+                "weighted_value": round(weighted_value, 2)
+            }
+            
+            # Deals expected to close within forecast period
+            if expected_close and expected_close <= forecast_date:
+                forecast_data["closing_soon"].append(deal_data)
+                closing_soon_value += weighted_value
+            
+            forecast_data["pipeline_weighted"].append(deal_data)
+            
+            # Group by stage
+            if stage_name not in forecast_data["by_stage"]:
+                forecast_data["by_stage"][stage_name] = {"count": 0, "total_value": 0, "weighted_value": 0}
+            forecast_data["by_stage"][stage_name]["count"] += 1
+            forecast_data["by_stage"][stage_name]["total_value"] += value
+            forecast_data["by_stage"][stage_name]["weighted_value"] += weighted_value
+            
+            # Group by owner
+            if owner_name not in forecast_data["by_owner"]:
+                forecast_data["by_owner"][owner_name] = {"count": 0, "total_value": 0, "weighted_value": 0}
+            forecast_data["by_owner"][owner_name]["count"] += 1
+            forecast_data["by_owner"][owner_name]["total_value"] += value
+            forecast_data["by_owner"][owner_name]["weighted_value"] += weighted_value
+        
+        # Sort closing soon by expected close date
+        forecast_data["closing_soon"].sort(key=lambda x: x.get("expected_close_date", "9999-12-31"))
+        
+        # Sort pipeline by weighted value
+        forecast_data["pipeline_weighted"].sort(key=lambda x: x["weighted_value"], reverse=True)
+        
+        result = {
+            "success": True,
+            "forecast_period": f"Next {days_ahead} days (until {forecast_date})",
+            "confidence_level": confidence_level,
+            "summary": {
+                "total_pipeline_value": round(total_pipeline_value, 2),
+                "weighted_forecast_total": round(weighted_forecast, 2),
+                "closing_soon_weighted": round(closing_soon_value, 2),
+                "deals_closing_soon": len(forecast_data["closing_soon"]),
+                "total_open_deals": len(forecast_data["pipeline_weighted"]),
+                "forecast_confidence": f"{confidence_level.title()} ({round(multiplier * 100)}% of historical rates)"
+            },
+            "forecast_breakdown": forecast_data,
+            "note": f"Revenue forecast based on historical win rates by stage with {confidence_level} confidence adjustment. Use for executive planning and BI reporting."
+        }
+        
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error generating revenue forecast: {str(e)}"
+
+@mcp.tool()
+async def get_conversion_funnel_analysis(start_date: str = "", end_date: str = "") -> str:
+    """
+    Analyze deal conversion rates through your sales funnel stages.
+    Essential for founder-level funnel optimization and BI analysis.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format (default: 90 days ago)
+        end_date: End date in YYYY-MM-DD format (default: today)
+    
+    Returns:
+        JSON string with detailed funnel conversion analysis
+    """
+    try:
+        # Default to last 90 days if no dates provided
+        now = datetime.now()
+        if not end_date:
+            end_date = now.strftime("%Y-%m-%d")
+        if not start_date:
+            start_date = (now - timedelta(days=90)).strftime("%Y-%m-%d")
+        
+        # Get all deals (all statuses) for the period
+        params = {"status": "all_not_deleted", "limit": 500}
+        deals_response = await pipedrive_client.make_api_request("/deals", params=params)
+        
+        if not deals_response.get("success"):
+            return f"Error fetching deals: {deals_response}"
+        
+        # Get stages information
+        stages_response = await pipedrive_client.make_api_request("/stages")
+        if not stages_response.get("success"):
+            return f"Error fetching stages: {stages_response}"
+        
+        stages = {stage["id"]: stage for stage in stages_response.get("data", [])}
+        
+        # Filter deals by date range (using add_time)
+        filtered_deals = []
+        for deal in deals_response.get("data", []):
+            add_time = deal.get("add_time", "")
+            if add_time:
+                deal_date = add_time.split("T")[0]
+                if start_date <= deal_date <= end_date:
+                    filtered_deals.append(deal)
+        
+        # Analyze funnel progression
+        funnel_analysis = {
+            "stage_performance": {},
+            "conversion_rates": {},
+            "stage_velocity": {},
+            "bottlenecks": []
+        }
+        
+        # Group deals by stage and status
+        stage_stats = {}
+        for deal in filtered_deals:
+            stage_id = deal.get("stage_id")
+            status = deal.get("status")
+            value = deal.get("value", 0) or 0
+            
+            if stage_id:
+                stage_name = stages.get(stage_id, {}).get("name", f"Stage {stage_id}")
+                stage_order = stages.get(stage_id, {}).get("order_nr", 999)
+                
+                if stage_id not in stage_stats:
+                    stage_stats[stage_id] = {
+                        "stage_name": stage_name,
+                        "stage_order": stage_order,
+                        "total_deals": 0,
+                        "won_deals": 0,
+                        "lost_deals": 0,
+                        "open_deals": 0,
+                        "total_value": 0,
+                        "won_value": 0,
+                        "lost_value": 0,
+                        "open_value": 0
+                    }
+                
+                stage_stats[stage_id]["total_deals"] += 1
+                stage_stats[stage_id]["total_value"] += value
+                
+                if status == "won":
+                    stage_stats[stage_id]["won_deals"] += 1
+                    stage_stats[stage_id]["won_value"] += value
+                elif status == "lost":
+                    stage_stats[stage_id]["lost_deals"] += 1
+                    stage_stats[stage_id]["lost_value"] += value
+                elif status == "open":
+                    stage_stats[stage_id]["open_deals"] += 1
+                    stage_stats[stage_id]["open_value"] += value
+        
+        # Calculate conversion rates and identify bottlenecks
+        sorted_stages = sorted(stage_stats.items(), key=lambda x: x[1]["stage_order"])
+        
+        for i, (stage_id, stats) in enumerate(sorted_stages):
+            stage_name = stats["stage_name"]
+            total_deals = stats["total_deals"]
+            won_deals = stats["won_deals"]
+            lost_deals = stats["lost_deals"]
+            
+            # Calculate stage-specific metrics
+            if total_deals > 0:
+                win_rate = (won_deals / total_deals) * 100
+                loss_rate = (lost_deals / total_deals) * 100
+                
+                funnel_analysis["stage_performance"][stage_name] = {
+                    "stage_order": stats["stage_order"],
+                    "total_deals": total_deals,
+                    "won_deals": won_deals,
+                    "lost_deals": lost_deals,
+                    "open_deals": stats["open_deals"],
+                    "win_rate": round(win_rate, 2),
+                    "loss_rate": round(loss_rate, 2),
+                    "total_value": stats["total_value"],
+                    "average_deal_value": round(stats["total_value"] / total_deals, 2)
+                }
+                
+                # Identify bottlenecks (stages with high loss rates)
+                if loss_rate > 50 and total_deals >= 5:  # Only flag if significant volume
+                    funnel_analysis["bottlenecks"].append({
+                        "stage": stage_name,
+                        "issue": "High loss rate",
+                        "loss_rate": round(loss_rate, 2),
+                        "deals_lost": lost_deals,
+                        "recommendation": "Review sales process and training for this stage"
+                    })
+        
+        # Calculate overall funnel metrics
+        total_deals_entered = sum(stats["total_deals"] for stats in stage_stats.values())
+        total_deals_won = sum(stats["won_deals"] for stats in stage_stats.values())
+        total_deals_lost = sum(stats["lost_deals"] for stats in stage_stats.values())
+        
+        overall_conversion = 0
+        if total_deals_entered > 0:
+            overall_conversion = (total_deals_won / total_deals_entered) * 100
+        
+        result = {
+            "success": True,
+            "analysis_period": f"{start_date} to {end_date}",
+            "overall_metrics": {
+                "total_deals_analyzed": total_deals_entered,
+                "total_won": total_deals_won,
+                "total_lost": total_deals_lost,
+                "overall_conversion_rate": round(overall_conversion, 2),
+                "total_value_analyzed": sum(stats["total_value"] for stats in stage_stats.values())
+            },
+            "funnel_analysis": funnel_analysis,
+            "note": "Funnel analysis based on deal creation date. Use to identify conversion bottlenecks and optimize sales process."
+        }
+        
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        return f"Error generating funnel analysis: {str(e)}"
+
+@mcp.tool()
+async def get_executive_dashboard(period: str = "month") -> str:
+    """
+    Generate a comprehensive executive dashboard with key metrics for founder review.
+    One-stop tool for high-level business intelligence and performance monitoring.
+    
+    Args:
+        period: Time period for analysis - "week", "month", "quarter" (default: "month")
+    
+    Returns:
+        JSON string with executive-level dashboard metrics
+    """
+    try:
+        # Calculate date ranges based on period
+        now = datetime.now()
+        if period == "week":
+            start_date = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+            previous_start = (now - timedelta(days=14)).strftime("%Y-%m-%d")
+            previous_end = (now - timedelta(days=7)).strftime("%Y-%m-%d")
+        elif period == "quarter":
+            start_date = (now - timedelta(days=90)).strftime("%Y-%m-%d")
+            previous_start = (now - timedelta(days=180)).strftime("%Y-%m-%d")
+            previous_end = (now - timedelta(days=90)).strftime("%Y-%m-%d")
+        else:  # month
+            start_date = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+            previous_start = (now - timedelta(days=60)).strftime("%Y-%m-%d")
+            previous_end = (now - timedelta(days=30)).strftime("%Y-%m-%d")
+        
+        end_date = now.strftime("%Y-%m-%d")
+        
+        # Get all deals
+        current_deals = await pipedrive_client.make_api_request("/deals", params={"status": "all_not_deleted", "limit": 500})
+        
+        if not current_deals.get("success"):
+            return f"Error fetching deals: {current_deals}"
+        
+        # Safely filter deals for current and previous periods
+        current_period_deals = []
+        previous_period_deals = []
+        
+        for deal in current_deals.get("data", []):
+            try:
+                add_time = deal.get("add_time")
+                if add_time and isinstance(add_time, str):
+                    # Extract date part safely
+                    if "T" in add_time:
+                        deal_date = add_time.split("T")[0]
+                    else:
+                        deal_date = add_time
+                    
+                    # Only proceed if we have a valid date string
+                    if deal_date and len(deal_date) == 10:  # YYYY-MM-DD format
+                        if deal_date >= start_date and deal_date <= end_date:
+                            current_period_deals.append(deal)
+                        elif deal_date >= previous_start and deal_date <= previous_end:
+                            previous_period_deals.append(deal)
+            except (AttributeError, IndexError, TypeError):
+                # Skip deals with invalid date formats
+                continue
+        
+        # Calculate key metrics safely
+        current_metrics = {
+            "deals_created": len(current_period_deals),
+            "deals_won": len([d for d in current_period_deals if d.get("status") == "won"]),
+            "deals_lost": len([d for d in current_period_deals if d.get("status") == "lost"]),
+            "revenue_won": sum(float(d.get("value") or 0) for d in current_period_deals if d.get("status") == "won"),
+            "pipeline_value": sum(float(d.get("value") or 0) for d in current_period_deals if d.get("status") == "open")
+        }
+        
+        previous_metrics = {
+            "deals_created": len(previous_period_deals),
+            "deals_won": len([d for d in previous_period_deals if d.get("status") == "won"]),
+            "revenue_won": sum(float(d.get("value") or 0) for d in previous_period_deals if d.get("status") == "won")
+        }
+        
+        # Calculate percentage changes
+        def calculate_change(current, previous):
+            if previous == 0:
+                return 100 if current > 0 else 0
+            return round(((current - previous) / previous) * 100, 2)
+        
+        # Top performers (by revenue won in current period)
+        owner_performance = {}
+        for deal in current_period_deals:
+            if deal.get("status") == "won":
+                owner = deal.get("owner_name") or "Unknown"
+                value = float(deal.get("value") or 0)
+                if owner not in owner_performance:
+                    owner_performance[owner] = {"deals_won": 0, "revenue": 0}
+                owner_performance[owner]["deals_won"] += 1
+                owner_performance[owner]["revenue"] += value
+        
+        top_performers = sorted(owner_performance.items(), key=lambda x: x[1]["revenue"], reverse=True)[:5]
+        
+        # Pipeline health for open deals
+        open_deals = [d for d in current_deals.get("data", []) if d.get("status") == "open"]
+        
+        # Safely calculate deals closing this week
+        closing_soon_count = 0
+        target_date = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+        
+        for deal in open_deals:
+            try:
+                close_date = deal.get("expected_close_date")
+                if close_date and isinstance(close_date, str) and len(close_date) >= 10:
+                    # Extract just the date part if it's a datetime string
+                    if "T" in close_date:
+                        close_date = close_date.split("T")[0]
+                    if close_date <= target_date:
+                        closing_soon_count += 1
+            except (TypeError, AttributeError, IndexError):
+                continue
+        
+        # Build dashboard
+        dashboard = {
+            "period": period,
+            "current_period": f"{start_date} to {end_date}",
+            "previous_period": f"{previous_start} to {previous_end}",
+            "key_metrics": {
+                "deals_created": {
+                    "current": current_metrics["deals_created"],
+                    "previous": previous_metrics["deals_created"],
+                    "change_percent": calculate_change(current_metrics["deals_created"], previous_metrics["deals_created"])
+                },
+                "deals_won": {
+                    "current": current_metrics["deals_won"],
+                    "previous": previous_metrics["deals_won"],
+                    "change_percent": calculate_change(current_metrics["deals_won"], previous_metrics["deals_won"])
+                },
+                "revenue_won": {
+                    "current": current_metrics["revenue_won"],
+                    "previous": previous_metrics["revenue_won"],
+                    "change_percent": calculate_change(current_metrics["revenue_won"], previous_metrics["revenue_won"])
+                },
+                "win_rate": {
+                    "current": round((current_metrics["deals_won"] / max(current_metrics["deals_created"], 1)) * 100, 2),
+                    "pipeline_value": current_metrics["pipeline_value"]
+                }
+            },
+            "top_performers": {
+                "by_revenue": [{"owner": k, **v} for k, v in top_performers]
+            },
+            "pipeline_health": {
+                "total_open_deals": len(open_deals),
+                "total_pipeline_value": sum(float(d.get("value") or 0) for d in open_deals),
+                "average_deal_value": round(sum(float(d.get("value") or 0) for d in open_deals) / max(len(open_deals), 1), 2),
+                "deals_closing_this_week": closing_soon_count
+            },
+            "performance_alerts": []
+        }
+        
+        # Performance alerts
+        if current_metrics["deals_created"] < previous_metrics["deals_created"] * 0.8:
+            dashboard["performance_alerts"].append({
+                "type": "warning",
+                "metric": "Deal Creation",
+                "message": f"Deal creation down {abs(dashboard['key_metrics']['deals_created']['change_percent'])}% vs previous {period}"
+            })
+        
+        if current_metrics["revenue_won"] < previous_metrics["revenue_won"] * 0.8:
+            dashboard["performance_alerts"].append({
+                "type": "critical",
+                "metric": "Revenue",
+                "message": f"Revenue down {abs(dashboard['key_metrics']['revenue_won']['change_percent'])}% vs previous {period}"
+            })
+        
+        result = {
+            "success": True,
+            "dashboard": dashboard,
+            "generated_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "note": "Executive dashboard for founder review. Includes period-over-period comparisons and performance alerts."
+        }
+        
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        import traceback
+        return f"Error generating executive dashboard: {str(e)}\nTraceback: {traceback.format_exc()}"
+
+# ========================
+# SERVER AND MAIN EXECUTION
+# ========================
 
 async def run_server():
     """Run the MCP server"""
